@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"syscall"
@@ -119,6 +120,9 @@ type Report struct {
 
 	GlobalV4Counters map[netip.AddrPort]int // number of times the endpoint was observed
 	GlobalV6Counters map[netip.AddrPort]int // number of times the endpoint was observed
+	// GlobalV4Sequence records observed IPv4 STUN mappings in arrival order
+	// for NAT port-allocation pattern classification (Cone / Linear / Random Symmetric).
+	GlobalV4Sequence []netip.AddrPort
 
 	GlobalV4 netip.AddrPort
 	GlobalV6 netip.AddrPort
@@ -182,6 +186,7 @@ func (r *Report) Clone() *Report {
 	r2.RegionV6Latency = maps.Clone(r2.RegionV6Latency)
 	r2.GlobalV4Counters = maps.Clone(r2.GlobalV4Counters)
 	r2.GlobalV6Counters = maps.Clone(r2.GlobalV6Counters)
+	r2.GlobalV4Sequence = slices.Clone(r2.GlobalV4Sequence)
 	return &r2
 }
 
@@ -721,6 +726,9 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 		updateLatency(ret.RegionV4Latency, node.RegionID, d)
 		ret.IPv4 = true
 		mak.Set(&ret.GlobalV4Counters, ipp, ret.GlobalV4Counters[ipp]+1)
+		if len(ret.GlobalV4Sequence) < 16 {
+			ret.GlobalV4Sequence = append(ret.GlobalV4Sequence, ipp)
+		}
 		if !rs.gotEP4.IsValid() {
 			rs.gotEP4 = ipp
 			ret.GlobalV4 = ipp

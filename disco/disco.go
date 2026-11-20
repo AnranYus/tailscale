@@ -51,6 +51,9 @@ const (
 	TypeCallMeMaybeVia                   = MessageType(0x07)
 	TypeAllocateUDPRelayEndpointRequest  = MessageType(0x08)
 	TypeAllocateUDPRelayEndpointResponse = MessageType(0x09)
+	TypePunchOffer                       = MessageType(0x0a)
+	TypePunchProbe                       = MessageType(0x0b)
+	TypePunchAck                         = MessageType(0x0c)
 )
 
 const v0 = byte(0)
@@ -103,6 +106,12 @@ func Parse(p []byte) (Message, error) {
 		return parseAllocateUDPRelayEndpointRequest(ver, p)
 	case TypeAllocateUDPRelayEndpointResponse:
 		return parseAllocateUDPRelayEndpointResponse(ver, p)
+	case TypePunchOffer:
+		return parsePunchOffer(ver, p)
+	case TypePunchProbe:
+		return parsePunchProbe(ver, p)
+	case TypePunchAck:
+		return parsePunchAck(ver, p)
 	default:
 		return nil, fmt.Errorf("unknown message type 0x%02x", byte(t))
 	}
@@ -304,6 +313,12 @@ func MessageSummary(m Message) string {
 		return "allocate-udp-relay-endpoint-request"
 	case *AllocateUDPRelayEndpointResponse:
 		return "allocate-udp-relay-endpoint-response"
+	case *PunchOffer:
+		return fmt.Sprintf("punch-offer id=%x nat=%s stage=%d reply=%v pub=%v", m.PunchID[:4], m.NATType, m.Stage, m.IsReply, m.PublicAddr)
+	case *PunchProbe:
+		return fmt.Sprintf("punch-probe id=%x", m.PunchID[:4])
+	case *PunchAck:
+		return fmt.Sprintf("punch-ack id=%x src=%v", m.PunchID[:4], m.Src)
 	default:
 		return fmt.Sprintf("%#v", m)
 	}
@@ -655,4 +670,147 @@ func parseCallMeMaybeVia(ver uint8, p []byte) (m *CallMeMaybeVia, err error) {
 	}
 	err = m.decode(p)
 	return m, err
+}
+
+// NATType classifies a node's IPv4 NAT port-mapping behavior for enhanced
+// hole punching (modeled after multi-tier Cone / Linear / Random Symmetric
+// traversal).
+type NATType uint8
+
+const (
+	NATUnknown         NATType = 0
+	NATCone            NATType = 1
+	NATLinearSymmetric NATType = 2
+	NATRandomSymmetric NATType = 3
+)
+
+func (n NATType) String() string {
+	switch n {
+	case NATCone:
+		return "cone"
+	case NATLinearSymmetric:
+		return "linear-sym"
+	case NATRandomSymmetric:
+		return "random-sym"
+	default:
+		return "unknown"
+	}
+}
+
+// PunchOffer is sent over DERP to negotiate a coordinated enhanced NAT
+// hole-punching session (linear port prediction or multi-socket birthday
+// attack).
+type PunchOffer struct {
+	PunchID    [8]byte
+	NATType    NATType
+	Stage      uint8          // 1 = linear prediction, 2 = birthday attack
+	IsReply    bool           // false = initial offer, true = accepted reply
+	PortDelta  int16          // observed port step for NATLinearSymmetric
+	NumSockets uint16         // socket count proposed by symmetric side
+	PublicAddr netip.AddrPort // sender's STUN-observed public IPv4 endpoint
+}
+
+const punchOfferLen = 8 + 1 + 1 + 1 + 2 + 2 + epLength
+
+func (m *PunchOffer) AppendMarshal(b []byte) []byte {
+	ret, d := appendMsgHeader(b, TypePunchOffer, v0, punchOfferLen)
+	copy(d[0:8], m.PunchID[:])
+	d[8] = byte(m.NATType)
+	d[9] = m.Stage
+	if m.IsReply {
+		d[10] = 1
+	}
+	binary.BigEndian.PutUint16(d[11:13], uint16(m.PortDelta))
+	binary.BigEndian.PutUint16(d[13:15], m.NumSockets)
+	if m.PublicAddr.IsValid() {
+		ip16 := m.PublicAddr.Addr().As16()
+		copy(d[15:31], ip16[:])
+		binary.BigEndian.PutUint16(d[31:33], m.PublicAddr.Port())
+	}
+	return ret
+}
+
+func parsePunchOffer(ver uint8, p []byte) (*PunchOffer, error) {
+	if len(p) < punchOfferLen {
+		return nil, errShort
+	}
+	m := new(PunchOffer)
+	copy(m.PunchID[:], p[0:8])
+	m.NATType = NATType(p[8])
+	m.Stage = p[9]
+	m.IsReply = (p[10] & 1) != 0
+	m.PortDelta = int16(binary.BigEndian.Uint16(p[11:13]))
+	m.NumSockets = binary.BigEndian.Uint16(p[13:15])
+	var ip16 [16]byte
+	copy(ip16[:], p[15:31])
+	port := binary.BigEndian.Uint16(p[31:33])
+	addr := netip.AddrFrom16(ip16).Unmap()
+	if !addr.IsUnspecified() || port != 0 {
+		m.PublicAddr = netip.AddrPortFrom(addr, port)
+	}
+	return m, nil
+}
+
+// PunchProbe is a lightweight UDP probe sent during enhanced hole punching.
+type PunchProbe struct {
+	PunchID [8]byte
+	NodeKey key.NodePublic
+}
+
+const punchProbeLen = 8 + key.NodePublicRawLen
+
+func (m *PunchProbe) AppendMarshal(b []byte) []byte {
+	ret, d := appendMsgHeader(b, TypePunchProbe, v0, punchProbeLen)
+	copy(d[0:8], m.PunchID[:])
+	if !m.NodeKey.IsZero() {
+		m.NodeKey.AppendTo(d[8:8])
+	}
+	return ret
+}
+
+func parsePunchProbe(ver uint8, p []byte) (*PunchProbe, error) {
+	if len(p) < punchProbeLen {
+		return nil, errShort
+	}
+	m := new(PunchProbe)
+	copy(m.PunchID[:], p[0:8])
+	m.NodeKey = key.NodePublicFromRaw32(mem.B(p[8 : 8+key.NodePublicRawLen]))
+	return m, nil
+}
+
+// PunchAck is sent in direct UDP reply to a matching [PunchProbe], echoing
+// back the observed external source address so both peers immediately confirm
+// the punched 5-tuple.
+type PunchAck struct {
+	PunchID [8]byte
+	Src     netip.AddrPort
+}
+
+const punchAckLen = 8 + epLength
+
+func (m *PunchAck) AppendMarshal(b []byte) []byte {
+	ret, d := appendMsgHeader(b, TypePunchAck, v0, punchAckLen)
+	copy(d[0:8], m.PunchID[:])
+	if m.Src.IsValid() {
+		ip16 := m.Src.Addr().As16()
+		copy(d[8:24], ip16[:])
+		binary.BigEndian.PutUint16(d[24:26], m.Src.Port())
+	}
+	return ret
+}
+
+func parsePunchAck(ver uint8, p []byte) (*PunchAck, error) {
+	if len(p) < punchAckLen {
+		return nil, errShort
+	}
+	m := new(PunchAck)
+	copy(m.PunchID[:], p[0:8])
+	var ip16 [16]byte
+	copy(ip16[:], p[8:24])
+	port := binary.BigEndian.Uint16(p[24:26])
+	addr := netip.AddrFrom16(ip16).Unmap()
+	if !addr.IsUnspecified() || port != 0 {
+		m.Src = netip.AddrPortFrom(addr, port)
+	}
+	return m, nil
 }

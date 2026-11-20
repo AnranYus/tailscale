@@ -150,6 +150,35 @@ func TestMarshalAndParse(t *testing.T) {
 			},
 			want: "09 00 00 00 00 01 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 01 02 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 01 02 00 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 00 00 00 00 00 00 7b 00 00 01 c8 00 00 00 00 3b 9a ca 00 00 00 00 0d f8 47 58 00 00 00 00 00 00 00 00 00 00 00 ff ff 01 02 03 04 02 37 20 01 00 00 00 00 00 00 00 00 00 00 00 00 34 56 03 15",
 		},
+		{
+			name: "punch_offer",
+			m: &PunchOffer{
+				PunchID:    [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+				NATType:    NATRandomSymmetric,
+				Stage:      2,
+				IsReply:    true,
+				PortDelta:  2,
+				NumSockets: 150,
+				PublicAddr: mustIPPort("2.3.4.5:1234"),
+			},
+			want: "0a 00 01 02 03 04 05 06 07 08 03 02 01 00 02 00 96 00 00 00 00 00 00 00 00 00 00 ff ff 02 03 04 05 04 d2",
+		},
+		{
+			name: "punch_probe",
+			m: &PunchProbe{
+				PunchID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+				NodeKey: key.NodePublicFromRaw32(mem.B([]byte{1: 1, 2: 2, 30: 30, 31: 31})),
+			},
+			want: "0b 00 01 02 03 04 05 06 07 08 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f",
+		},
+		{
+			name: "punch_ack",
+			m: &PunchAck{
+				PunchID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+				Src:     mustIPPort("2.3.4.5:1234"),
+			},
+			want: "0c 00 01 02 03 04 05 06 07 08 00 00 00 00 00 00 00 00 00 00 ff ff 02 03 04 05 04 d2",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

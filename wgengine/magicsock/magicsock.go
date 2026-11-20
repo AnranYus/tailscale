@@ -215,6 +215,14 @@ type Conn struct {
 	// It must have buffer size > 0; see issue 3736.
 	derpRecvCh chan derpReadResult
 
+	// punchRecvCh is used by receivePunch to read WireGuard packets received
+	// on per-endpoint adopted punch UDP sockets.
+	punchRecvCh chan punchReadResult
+
+	// punchMgr coordinates enhanced NAT hole punching (linear port prediction
+	// and multi-socket birthday attack).
+	punchMgr *punchManager
+
 	// bind is the wireguard-go conn.Bind for Conn.
 	bind *connBind
 
@@ -598,6 +606,7 @@ func newConn(logf logger.Logf) *Conn {
 	c := &Conn{
 		logf:          logf,
 		derpRecvCh:    make(chan derpReadResult, 1), // must be buffered, see issue 3736
+		punchRecvCh:   make(chan punchReadResult, 256),
 		derpStarted:   make(chan struct{}),
 		peerLastDerp:  make(map[key.NodePublic]tailcfg.DERPRegionID),
 		peerMap:       newPeerMap(),
@@ -606,6 +615,7 @@ func newConn(logf logger.Logf) *Conn {
 		initializedAt: mono.Now(),
 		udpSockets:    1,
 	}
+	c.punchMgr = newPunchManager(c)
 	c.discoAtomic.Set(discoPrivate)
 	c.bind = &connBind{Conn: c, closed: true}
 	c.muCond = sync.NewCond(&c.mu)
@@ -2075,6 +2085,10 @@ func (c *Conn) sendDiscoAllocateUDPRelayEndpointRequest(dst epAddr, dstKey key.N
 // The dstKey should only be non-zero if the dstDisco key
 // unambiguously maps to exactly one peer.
 func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
+	return c.sendDiscoMessageVia(nil, dst, dstKey, dstDisco, m, logLevel)
+}
+
+func (c *Conn) sendDiscoMessageVia(overrideConn nettype.PacketConn, dst epAddr, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
 	isDERP := dst.ap.Addr() == tailcfg.DerpMagicIPAddr
 	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.ap.Addr().Is4() {
 		time.Sleep(debugIPv4DiscoPingPenalty())
@@ -2138,7 +2152,16 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 	box := di.sharedKey.Seal(m.AppendMarshal(nil))
 	pkt = append(pkt, box...)
 	const isDisco = true
-	sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco, dst.vni.IsSet())
+	if overrideConn != nil && !isDERP {
+		if c.onlyTCP443.Load() {
+			sent, err = false, nil
+		} else {
+			_, err = overrideConn.WriteToUDPAddrPort(pkt, dst.ap)
+			sent = err == nil
+		}
+	} else {
+		sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco, dst.vni.IsSet())
+	}
 	if sent {
 		if logLevel == discoLog || (logLevel == discoVerboseLog && debugDisco()) {
 			node := "?"
@@ -2621,6 +2644,33 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			RxFromNodeKey:  nodeKey,
 			Message:        req,
 		})
+	case *disco.PunchOffer:
+		if !buildfeatures.HasNATTraversal {
+			return
+		}
+		if !isDERP || derpNodeSrc.IsZero() {
+			c.logf("[unexpected] PunchOffer packets should only come via DERP")
+			return
+		}
+		ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc)
+		if !ok {
+			return
+		}
+		epDisco, knownKey := ep.checkAndUpdateDiscoKey(di.discoKey)
+		if epDisco == nil || !knownKey {
+			return
+		}
+		go c.punchMgr.handlePunchOffer(ep, epDisco.key(), dm)
+	case *disco.PunchProbe:
+		if !buildfeatures.HasNATTraversal {
+			return
+		}
+		c.punchMgr.handlePunchProbeLocked(dm, src, di)
+	case *disco.PunchAck:
+		if !buildfeatures.HasNATTraversal {
+			return
+		}
+		c.punchMgr.handlePunchAckLocked(dm, src, di)
 	}
 	return
 }
@@ -2765,7 +2815,23 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 
 	ipDst := src
 	discoDest := di.discoKey
-	go c.sendDiscoMessage(ipDst, dstKey, discoDest, &disco.Pong{
+	var overrideConn nettype.PacketConn
+	if !isDerp {
+		if !dstKey.IsZero() {
+			if ep, ok := c.peerMap.endpointForNodeKey(dstKey); ok {
+				overrideConn = ep.punchConnFor(ipDst)
+			}
+		} else {
+			c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) bool {
+				if pc := ep.punchConnFor(ipDst); pc != nil {
+					overrideConn = pc
+					return false
+				}
+				return true
+			})
+		}
+	}
+	go c.sendDiscoMessageVia(overrideConn, ipDst, dstKey, discoDest, &disco.Pong{
 		TxID: dm.TxID,
 		Src:  src.ap,
 	}, discoVerboseLog)
@@ -3644,6 +3710,9 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 		fns = append(fns, c.mkReceiveFunc(cfg))
 	}
 	fns = append(fns, c.mkReceiveDERPFunc())
+	if hasUDPTransport {
+		fns = append(fns, c.mkReceivePunchFunc())
+	}
 	return fns, c.LocalPort(), nil
 }
 
@@ -3697,7 +3766,11 @@ func (c *connBind) ReceiveNames() []string {
 	for _, cfg := range c.udpReceiveConfigs() {
 		names = append(names, c.receiveName(cfg.family, cfg.socket))
 	}
-	return append(names, receiveDERPName)
+	names = append(names, receiveDERPName)
+	if hasUDPTransport {
+		names = append(names, receivePunchName)
+	}
+	return names
 }
 
 // receiveName returns the name of the ReceiveFunc reading from socket sock of
@@ -3740,6 +3813,10 @@ func (c *connBind) Close() error {
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
 	c.derpRecvCh <- derpReadResult{}
+	select {
+	case c.punchRecvCh <- punchReadResult{}:
+	default:
+	}
 	return nil
 }
 
@@ -3778,6 +3855,9 @@ func (c *Conn) Close() error {
 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
 		ep.stopAndReset()
 	})
+	if c.punchMgr != nil {
+		c.punchMgr.close()
+	}
 
 	c.closed = true
 	c.connCtxCancel()
@@ -4081,6 +4161,9 @@ func (c *Conn) Rebind() {
 
 	if len(ifIPs) > 0 {
 		c.maybeCloseDERPsOnRebind(ifIPs)
+	}
+	if c.punchMgr != nil {
+		c.punchMgr.invalidateNATCache()
 	}
 	c.resetEndpointStates()
 }

@@ -34,6 +34,7 @@ import (
 	"tailscale.com/types/bools"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/ringlog"
 	"tailscale.com/util/slicesx"
@@ -105,6 +106,13 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only. Must not be changed after initializing the endpont.
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+
+	// Enhanced NAT hole-punching state (winning socket handover + cooldowns).
+	punchConn         nettype.PacketConn // dedicated UDP socket adopted from birthday-attack punch; nil if unused
+	punchAddr         epAddr             // remote address paired with punchConn
+	punchCancel       context.CancelFunc // cancels readPunchConnLoop for punchConn
+	firstDirectFailAt mono.Time          // when direct discovery first failed during active session
+	lastEnhancedPunch mono.Time          // last time enhanced hole punching was initiated
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -137,6 +145,15 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 }
 
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
+	if de.punchConn != nil && v.epAddr != de.punchAddr {
+		de.clearPunchConnLocked()
+	}
+	if v.isDirect() {
+		de.firstDirectFailAt = 0
+		if de.c != nil && de.c.punchMgr != nil {
+			de.c.punchMgr.cancelPeer(de.publicKey)
+		}
+	}
 	if v.epAddr != de.bestAddr.epAddr {
 		de.probeUDPLifetime.resetCycleEndpointLocked()
 
@@ -942,6 +959,11 @@ func (de *endpoint) heartbeat() {
 		de.discoverUDPRelayPathsLocked(now)
 	}
 
+	if buildfeatures.HasNATTraversal && de.wantEnhancedPunchLocked(now) {
+		de.lastEnhancedPunch = now
+		go de.c.punchMgr.initiate(de)
+	}
+
 	de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
 }
 
@@ -1118,6 +1140,8 @@ func (de *endpoint) send(flow int, buffs [][]byte, offset int, forceMirror bool)
 
 	now := mono.Now()
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now, forceMirror)
+	punchConn := de.punchConn
+	punchAddr := de.punchAddr
 
 	if !hasUDPTransport {
 		// There are no UDP paths to discover; everything goes over DERP.
@@ -1129,6 +1153,10 @@ func (de *endpoint) send(flow int, buffs [][]byte, offset int, forceMirror bool)
 		de.sendDiscoPingsLocked(now, true)
 		if buildfeatures.HasNATTraversal && de.wantUDPRelayPathDiscoveryLocked(now) {
 			de.discoverUDPRelayPathsLocked(now)
+		}
+		if buildfeatures.HasNATTraversal && de.wantEnhancedPunchLocked(now) {
+			de.lastEnhancedPunch = now
+			go de.c.punchMgr.initiate(de)
 		}
 	}
 	de.noteTxActivityExtTriggerLocked(now)
@@ -1148,7 +1176,15 @@ func (de *endpoint) send(flow int, buffs [][]byte, offset int, forceMirror bool)
 	}
 	var err error
 	if hasUDPTransport && udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(flow, udpAddr, buffs, offset)
+		if punchConn != nil && udpAddr == punchAddr && !udpAddr.vni.IsSet() {
+			for _, b := range buffs {
+				if _, werr := punchConn.WriteToUDPAddrPort(b[offset:], udpAddr.ap); werr != nil && err == nil {
+					err = werr
+				}
+			}
+		} else {
+			_, err = de.c.sendUDPBatch(flow, udpAddr, buffs, offset)
+		}
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
@@ -1315,7 +1351,8 @@ func (de *endpoint) sendDiscoPing(ep epAddr, discoKey key.DiscoPublic, txid stun
 	size = min(size, MaxDiscoPingSize)
 	padding := max(size-discoPingSize, 0)
 
-	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
+	pconn := de.punchConnFor(ep)
+	sent, _ := de.c.sendDiscoMessageVia(pconn, ep, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
 		Padding: padding,
@@ -1428,6 +1465,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 	if debugNeverDirectUDP() {
 		return // skip when direct UDP is disabled
+	}
+	if de.firstDirectFailAt.IsZero() && (!de.bestAddr.isDirect() || now.After(de.trustBestAddrUntil)) {
+		de.firstDirectFailAt = now
 	}
 	de.lastFullPing = now
 	var sentAny bool
@@ -1876,6 +1916,7 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 //
 // de.mu must be held.
 func (de *endpoint) clearBestAddrLocked() {
+	de.clearPunchConnLocked()
 	de.setBestAddrLocked(addrQuality{})
 	de.bestAddrAt = 0
 	de.trustBestAddrUntil = 0
@@ -2323,6 +2364,8 @@ func (de *endpoint) invalidateDiscoPathLocked() {
 	de.lastSendExt = 0
 	de.lastFullPing = 0
 	de.lastUDPRelayPathDiscovery = 0
+	de.firstDirectFailAt = 0
+	de.lastEnhancedPunch = 0
 	for _, es := range de.endpointState {
 		es.lastPing = 0
 	}
@@ -2334,6 +2377,9 @@ func (de *endpoint) invalidateDiscoPathLocked() {
 	de.probeUDPLifetime.resetCycleEndpointLocked()
 	if buildfeatures.HasNATTraversal && de.c != nil {
 		de.c.relayManager.stopWork(de)
+		if de.c.punchMgr != nil {
+			de.c.punchMgr.cancelPeer(de.publicKey)
+		}
 	}
 }
 

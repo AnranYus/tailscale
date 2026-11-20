@@ -68,7 +68,7 @@ func TestUDPSocketsOne(t *testing.T) {
 			if _, _, err := c.bind.Open(0); err != nil {
 				t.Fatal(err)
 			}
-			want := []string{"ReceiveIPv4", "ReceiveIPv6", "ReceiveDERP"}
+			want := []string{"ReceiveIPv4", "ReceiveIPv6", "ReceiveDERP", "ReceivePunch"}
 			if got := c.bind.ReceiveNames(); !slices.Equal(got, want) {
 				t.Errorf("ReceiveNames = %q, want %q", got, want)
 			}

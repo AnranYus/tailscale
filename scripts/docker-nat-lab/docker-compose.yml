@@ -1,0 +1,196 @@
+services:
+  control:
+    build: .
+    image: ts-natlab:local
+    container_name: ts-natlab-control
+    cap_add:
+      - NET_ADMIN
+    networks:
+      wan:
+        ipv4_address: 198.51.100.2
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        WAN_IF=$$(ip -o -4 addr show | awk '/198\.51\.100\.2\//{print $$2; exit}')
+        ip addr add 198.51.100.3/24 dev "$$WAN_IF" || true
+        ip addr add 198.51.100.4/24 dev "$$WAN_IF" || true
+        ip addr add 198.51.100.5/24 dev "$$WAN_IF" || true
+        stund -stun=198.51.100.3:3478 -http=127.0.0.1:13479 &
+        stund -stun=198.51.100.4:3478 -http=127.0.0.1:13480 &
+        stund -stun=198.51.100.5:3478 -http=127.0.0.1:13481 &
+        exec testcontrol --addr=198.51.100.2:9911
+
+  # Simulated Home Broadband Router (default NAT3: MASQUERADE; set NAT_HOME_RULE to test NAT4-NAT4)
+  nat-home:
+    image: ts-natlab:local
+    container_name: ts-natlab-nat-home
+    depends_on: [control]
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      NAT_RULE: "${NAT_HOME_RULE:-MASQUERADE}"
+    networks:
+      wan:
+        ipv4_address: 198.51.100.20
+      lan_home:
+        ipv4_address: 192.168.5.254
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        WAN_IF=$$(ip -o -4 addr show | awk '/198\.51\.100\./{print $$2; exit}')
+        LAN_IF=$$(ip -o -4 addr show | awk '/192\.168\.5\./{print $$2; exit}')
+        iptables -F
+        iptables -t nat -F
+        iptables -P INPUT DROP
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -i "$$LAN_IF" -j ACCEPT
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -P FORWARD DROP
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A FORWARD -i "$$LAN_IF" -o "$$WAN_IF" -j ACCEPT
+        if [ "$$NAT_RULE" = "PBA512" ]; then
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -p udp -j MASQUERADE --to-ports 30208-30719 --random-fully
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -j MASQUERADE
+        elif [ "$$NAT_RULE" = "SYMMETRIC" ]; then
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -j MASQUERADE --random-fully
+        else
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -j MASQUERADE
+        fi
+        echo "nat-home ready: mode=$$NAT_RULE ($$LAN_IF -> $$WAN_IF)"
+        exec sleep infinity
+
+  # Simulated Corp / Mobile Gateway (default NAT4: MASQUERADE --random-fully)
+  nat-corp:
+    image: ts-natlab:local
+    container_name: ts-natlab-nat-corp
+    depends_on: [control]
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      NAT_RULE: "${NAT_CORP_RULE:-SYMMETRIC}"
+    networks:
+      wan:
+        ipv4_address: 198.51.100.10
+      lan_corp:
+        ipv4_address: 10.172.17.254
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        WAN_IF=$$(ip -o -4 addr show | awk '/198\.51\.100\./{print $$2; exit}')
+        LAN_IF=$$(ip -o -4 addr show | awk '/10\.172\.17\./{print $$2; exit}')
+        iptables -F
+        iptables -t nat -F
+        iptables -P INPUT DROP
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -i "$$LAN_IF" -j ACCEPT
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -P FORWARD DROP
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A FORWARD -i "$$LAN_IF" -o "$$WAN_IF" -j ACCEPT
+        if [ "$$NAT_RULE" = "PBA512" ]; then
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -p udp -j MASQUERADE --to-ports 28160-28671 --random-fully
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -j MASQUERADE
+        else
+          iptables -t nat -A POSTROUTING -o "$$WAN_IF" -j MASQUERADE --random-fully
+        fi
+        echo "nat-corp ready: mode=$$NAT_RULE ($$LAN_IF -> $$WAN_IF)"
+        exec sleep infinity
+
+  peer-home:
+    image: ts-natlab:local
+    container_name: ts-natlab-peer-home
+    depends_on: [control, nat-home]
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    environment:
+      TS_ENHANCED_PUNCH: "${TS_ENHANCED_PUNCH:-true}"
+      TS_ENHANCED_PUNCH_SOCKETS: "${TS_ENHANCED_PUNCH_SOCKETS:-200}"
+      TS_ENHANCED_PUNCH_PROBES: "${TS_ENHANCED_PUNCH_PROBES:-1600}"
+      TS_ENHANCED_PUNCH_PPS: "${TS_ENHANCED_PUNCH_PPS:-400}"
+      TS_ENHANCED_PUNCH_STUN_SERVERS: "198.51.100.3:3478,198.51.100.4:3478,198.51.100.5:3478"
+      TS_ENHANCED_PUNCH_FW_CHECK: "false"
+    networks:
+      lan_home:
+        ipv4_address: 192.168.5.12
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        ip route replace default via 192.168.5.254
+        rm -rf /tmp/ts && mkdir -p /tmp/ts
+        tailscaled --tun=userspace-networking --statedir=/tmp/ts --socket=/tmp/tailscaled.sock --no-logs-no-support &
+        TS_PID=$$!
+        for i in $$(seq 1 30); do
+          [ -S /tmp/tailscaled.sock ] && break
+          sleep 0.2
+        done
+        tailscale --socket=/tmp/tailscaled.sock up --login-server=http://198.51.100.2:9911 --hostname=peer-home
+        wait $$TS_PID
+
+  peer-corp:
+    image: ts-natlab:local
+    container_name: ts-natlab-peer-corp
+    depends_on: [control, nat-corp]
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    environment:
+      TS_ENHANCED_PUNCH: "${TS_ENHANCED_PUNCH:-true}"
+      TS_ENHANCED_PUNCH_SOCKETS: "${TS_ENHANCED_PUNCH_SOCKETS:-200}"
+      TS_ENHANCED_PUNCH_PROBES: "${TS_ENHANCED_PUNCH_PROBES:-1600}"
+      TS_ENHANCED_PUNCH_PPS: "${TS_ENHANCED_PUNCH_PPS:-400}"
+      TS_ENHANCED_PUNCH_STUN_SERVERS: "198.51.100.3:3478,198.51.100.4:3478,198.51.100.5:3478"
+      TS_ENHANCED_PUNCH_FW_CHECK: "false"
+    networks:
+      lan_corp:
+        ipv4_address: 10.172.17.201
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        ip route replace default via 10.172.17.254
+        rm -rf /tmp/ts && mkdir -p /tmp/ts
+        tailscaled --tun=userspace-networking --statedir=/tmp/ts --socket=/tmp/tailscaled.sock --no-logs-no-support &
+        TS_PID=$$!
+        for i in $$(seq 1 30); do
+          [ -S /tmp/tailscaled.sock ] && break
+          sleep 0.2
+        done
+        tailscale --socket=/tmp/tailscaled.sock up --login-server=http://198.51.100.2:9911 --hostname=peer-corp
+        wait $$TS_PID
+
+networks:
+  wan:
+    internal: true
+    ipam:
+      config:
+        - subnet: 198.51.100.0/24
+  lan_home:
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.168.5.0/24
+  lan_corp:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.172.17.0/24
